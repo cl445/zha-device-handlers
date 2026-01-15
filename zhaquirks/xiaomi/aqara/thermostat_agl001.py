@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from functools import reduce
-import logging
 import math
 import struct
 from typing import Any, Final
@@ -14,14 +13,10 @@ from zigpy.quirks.v2.homeassistant import EntityType, UnitOfTemperature
 from zigpy.quirks.v2.homeassistant.binary_sensor import BinarySensorDeviceClass
 from zigpy.quirks.v2.homeassistant.number import NumberDeviceClass
 import zigpy.types as t
-from zigpy.zcl.clusters.general import Basic, DeviceTemperature
 from zigpy.zcl.clusters.hvac import Thermostat
 from zigpy.zcl.foundation import ZCLAttributeDef
 
-from zhaquirks import LocalDataCluster
 from zhaquirks.xiaomi import LUMI, XiaomiAqaraE1Cluster, XiaomiPowerConfiguration
-
-_LOGGER = logging.getLogger(__name__)
 
 ZCL_SYSTEM_MODE = Thermostat.attributes_by_name["system_mode"].id
 
@@ -30,23 +25,11 @@ XIAOMI_SYSTEM_MODE_MAP = {
     1: Thermostat.SystemMode.Heat,
 }
 
-
-class SystemMode(t.enum8):
-    """Xiaomi TRV system mode.
-
-    Maps to ZCL Thermostat.SystemMode but with Xiaomi-specific values.
-    """
-
-    Off = 0x00  # Heating disabled
-    Heat = 0x01  # Heating enabled
-
-
 SYSTEM_MODE = 0x0271
 PRESET = 0x0272
 WINDOW_DETECTION = 0x0273
 VALVE_DETECTION = 0x0274
 VALVE_ALARM = 0x0275
-CALIBRATE = 0x0270
 CHILD_LOCK = 0x0277
 AWAY_PRESET_TEMPERATURE = 0x0279
 WINDOW_OPEN = 0x027A
@@ -55,43 +38,8 @@ SCHEDULE = 0x027D
 SCHEDULE_SETTINGS = 0x0276
 SENSOR = 0x027E
 BATTERY_PERCENTAGE = 0x040A
-HEARTBEAT = 0x00F7
 
-XIAOMI_MANUFACTURER_CODE = 0x115F
-
-# Heartbeat data keys (from TLV structure)
-HEARTBEAT_DEVICE_TEMPERATURE = 3
-HEARTBEAT_POWER_OUTAGE_COUNT = 5
-HEARTBEAT_FIRMWARE_VERSION = 13
-HEARTBEAT_PRESET = 101
-HEARTBEAT_LOCAL_TEMPERATURE = 102
-HEARTBEAT_HEATING_SETPOINT = 103
-HEARTBEAT_VALVE_ALARM = 104
-HEARTBEAT_BATTERY = 105
-
-
-class Preset(t.enum8):
-    """TRV operating preset.
-
-    Determines the operating mode of the thermostat.
-    """
-
-    Manual = 0x00  # Manual temperature control
-    Auto = 0x01  # Automatic schedule-based control
-    Away = 0x02  # Away/vacation mode with reduced temperature
-    Setup = 0x03  # Initial setup mode after powering ("E11" on display)
-
-
-class SensorMode(t.enum8):
-    """Temperature sensor mode.
-
-    Determines which temperature source the TRV uses for regulation.
-    """
-
-    Internal = 0x00  # Use internal temperature sensor (at the radiator)
-    ExternalPaired = 0x01  # External Aqara sensor paired via Aqara Hub (automatic)
-    ExternalInput = 0x02  # External temperature input via automation (manual updates)
-
+XIAOMI_CLUSTER_ID = 0xFCC0
 
 DAYS_MAP = {
     "mon": 0x02,
@@ -105,18 +53,30 @@ DAYS_MAP = {
 NEXT_DAY_FLAG = 1 << 15
 
 
+class Preset(t.enum8):
+    """TRV operating preset."""
+
+    Manual = 0x00
+    Auto = 0x01
+    Away = 0x02
+
+
+class SensorMode(t.enum8):
+    """Temperature sensor mode."""
+
+    Internal = 0x00
+    ExternalPaired = 0x01
+    ExternalInput = 0x02
+
+
 class ThermostatCluster(CustomCluster, Thermostat):
     """Thermostat cluster."""
 
-    # remove cooling mode
     _CONSTANT_ATTRIBUTES = {
         Thermostat.attributes_by_name[
             "ctrl_sequence_of_oper"
         ].id: Thermostat.ControlSequenceOfOperation.Heating_Only
     }
-
-    # Attribute IDs for special handling
-    _RUNNING_STATE_ATTR = Thermostat.AttributeDefs.running_state.id
 
     async def read_attributes(
         self,
@@ -129,21 +89,6 @@ class ThermostatCluster(CustomCluster, Thermostat):
         successful_r, failed_r = {}, {}
         remaining_attributes = attributes.copy()
 
-        # Handle running_state - device doesn't support it natively, we simulate it
-        # from heartbeat data. Return cached value or default to Idle.
-        running_state_requested = (
-            self._RUNNING_STATE_ATTR in attributes or "running_state" in attributes
-        )
-        if running_state_requested:
-            if self._RUNNING_STATE_ATTR in attributes:
-                remaining_attributes.remove(self._RUNNING_STATE_ATTR)
-            if "running_state" in attributes:
-                remaining_attributes.remove("running_state")
-            # Return cached value (set by heartbeat) or default to Idle (0)
-            cached_state = self._attr_cache.get(self._RUNNING_STATE_ATTR, 0)
-            successful_r[self._RUNNING_STATE_ATTR] = cached_state
-
-        # read system_mode from Xiaomi cluster (can be numeric or string)
         if ZCL_SYSTEM_MODE in attributes or "system_mode" in attributes:
             self.debug("Passing 'system_mode' read to Xiaomi cluster")
 
@@ -155,12 +100,10 @@ class ThermostatCluster(CustomCluster, Thermostat):
             successful_r, failed_r = await self.endpoint.opple_cluster.read_attributes(
                 [SYSTEM_MODE], allow_cache, only_cache, manufacturer
             )
-            # convert Xiaomi system_mode to ZCL attribute
             if SYSTEM_MODE in successful_r:
                 successful_r[ZCL_SYSTEM_MODE] = XIAOMI_SYSTEM_MODE_MAP[
                     successful_r.pop(SYSTEM_MODE)
                 ]
-        # read remaining attributes from thermostat cluster
         if remaining_attributes:
             remaining_result = await super().read_attributes(
                 remaining_attributes, allow_cache, only_cache, manufacturer
@@ -177,7 +120,6 @@ class ThermostatCluster(CustomCluster, Thermostat):
         remaining_attributes = attributes.copy()
         system_mode_value = None
 
-        # check if system_mode is being written (can be numeric or string)
         if ZCL_SYSTEM_MODE in attributes:
             remaining_attributes.pop(ZCL_SYSTEM_MODE)
             system_mode_value = attributes.get(ZCL_SYSTEM_MODE)
@@ -185,14 +127,12 @@ class ThermostatCluster(CustomCluster, Thermostat):
             remaining_attributes.pop("system_mode")
             system_mode_value = attributes.get("system_mode")
 
-        # write system_mode to Xiaomi cluster if applicable
         if system_mode_value is not None:
             self.debug("Passing 'system_mode' write to Xiaomi cluster")
             result += await self.endpoint.opple_cluster.write_attributes(
                 {SYSTEM_MODE: min(int(system_mode_value), 1)}
             )
 
-        # write remaining attributes to thermostat cluster
         if remaining_attributes:
             result += await super().write_attributes(remaining_attributes, manufacturer)
         return result
@@ -428,85 +368,12 @@ class ScheduleSettings(t.LVBytes):
         return result
 
 
-class LocalDeviceTemperatureCluster(LocalDataCluster, DeviceTemperature):
-    """Device temperature cluster for internal TRV temperature."""
-
-    _CONSTANT_ATTRIBUTES = {
-        DeviceTemperature.AttributeDefs.min_temp_experienced.id: -4000,
-        DeviceTemperature.AttributeDefs.max_temp_experienced.id: 12500,
-    }
-
-
-# ZCL data type sizes for heartbeat parsing (type_id: (size, signed))
-_ZCL_TYPE_SIZES: dict[int, tuple[int, bool]] = {
-    0x10: (1, False),  # Bool
-    0x20: (1, False),  # uint8
-    0x21: (2, False),  # uint16
-    0x22: (3, False),  # uint24
-    0x23: (4, False),  # uint32
-    0x24: (5, False),  # uint40
-    0x25: (6, False),  # uint48
-    0x28: (1, True),  # int8
-    0x29: (2, True),  # int16
-    0x2B: (4, True),  # int32
-}
-
-
-def _parse_heartbeat(value: bytes) -> dict[int, Any]:
-    """Parse Xiaomi TLV heartbeat structure.
-
-    The heartbeat is a TLV-encoded structure where each entry consists of:
-    - 1 byte: key/index
-    - 1 byte: data type (ZCL type)
-    - N bytes: value (length depends on type)
-
-    Returns a dictionary mapping keys to their parsed values.
-    """
-    result: dict[int, Any] = {}
-    if not value or not isinstance(value, (bytes, bytearray)):
-        return result
-
-    i = 0
-    while i < len(value) - 1:
-        key = value[i]
-        data_type = value[i + 1]
-
-        try:
-            if data_type in _ZCL_TYPE_SIZES:
-                size, signed = _ZCL_TYPE_SIZES[data_type]
-                result[key] = int.from_bytes(
-                    value[i + 2 : i + 2 + size], "little", signed=signed
-                )
-                i += 2 + size
-            elif data_type == 0x39:  # float (single precision)
-                result[key] = struct.unpack("<f", value[i + 2 : i + 6])[0]
-                i += 6
-            else:
-                _LOGGER.debug(
-                    "Unknown data type 0x%02x at position %d in heartbeat",
-                    data_type,
-                    i,
-                )
-                break
-        except (IndexError, struct.error):
-            _LOGGER.debug("Error parsing heartbeat at position %d", i)
-            break
-
-    return result
-
-
 class AqaraThermostatSpecificCluster(XiaomiAqaraE1Cluster):
     """Aqara manufacturer specific settings."""
 
     class AttributeDefs(XiaomiAqaraE1Cluster.AttributeDefs):
         """Attribute definitions."""
 
-        heartbeat: Final = ZCLAttributeDef(
-            id=HEARTBEAT, type=t.LVBytes, is_manufacturer_specific=True
-        )
-        calibrate: Final = ZCLAttributeDef(
-            id=CALIBRATE, type=t.uint8_t, is_manufacturer_specific=True
-        )
         system_mode: Final = ZCLAttributeDef(
             id=SYSTEM_MODE, type=t.uint8_t, is_manufacturer_specific=True
         )
@@ -552,141 +419,10 @@ class AqaraThermostatSpecificCluster(XiaomiAqaraE1Cluster):
         if attrid == BATTERY_PERCENTAGE:
             self.endpoint.power.battery_percent_reported(value)
         elif attrid == SYSTEM_MODE:
-            # update ZCL system_mode attribute (e.g. on attribute reports)
             self.endpoint.thermostat.update_attribute(
                 ZCL_SYSTEM_MODE, XIAOMI_SYSTEM_MODE_MAP[value]
             )
-        elif attrid == HEARTBEAT:
-            self._handle_heartbeat(value)
-        elif attrid == PRESET:
-            # Check for setup mode (preset=3)
-            if value == Preset.Setup:
-                self.debug("Device is in setup mode (E11)")
         super()._update_attribute(attrid, value)
-
-    def _handle_heartbeat(self, value: bytes) -> None:
-        """Handle heartbeat message and update related clusters."""
-        heartbeat_data = _parse_heartbeat(value)
-        self.debug("Parsed heartbeat data: %s", heartbeat_data)
-
-        # Update device temperature
-        if HEARTBEAT_DEVICE_TEMPERATURE in heartbeat_data:
-            device_temp = heartbeat_data[HEARTBEAT_DEVICE_TEMPERATURE]
-            # Device temperature is in degrees Celsius, ZCL expects centidegrees
-            self.endpoint.device_temperature.update_attribute(
-                DeviceTemperature.AttributeDefs.current_temperature.id,
-                device_temp * 100,
-            )
-
-        # Update local temperature on thermostat
-        if HEARTBEAT_LOCAL_TEMPERATURE in heartbeat_data:
-            local_temp = heartbeat_data[HEARTBEAT_LOCAL_TEMPERATURE]
-            # Temperature is already in centidegrees from heartbeat
-            self.endpoint.thermostat.update_attribute(
-                Thermostat.AttributeDefs.local_temperature.id,
-                local_temp,
-            )
-
-        # Update battery
-        if HEARTBEAT_BATTERY in heartbeat_data:
-            battery = heartbeat_data[HEARTBEAT_BATTERY]
-            self.endpoint.power.battery_percent_reported(battery)
-
-        # Update preset (and detect setup mode)
-        if HEARTBEAT_PRESET in heartbeat_data:
-            preset = heartbeat_data[HEARTBEAT_PRESET]
-            if preset == Preset.Setup:
-                self.debug("Device is in setup mode (E11) from heartbeat")
-            self.update_attribute(PRESET, preset)
-
-        # Update valve alarm
-        if HEARTBEAT_VALVE_ALARM in heartbeat_data:
-            valve_alarm = heartbeat_data[HEARTBEAT_VALVE_ALARM]
-            self.update_attribute(VALVE_ALARM, 1 if valve_alarm == 1 else 0)
-
-        # Store power outage count for reference
-        if HEARTBEAT_POWER_OUTAGE_COUNT in heartbeat_data:
-            power_outage_count = heartbeat_data[HEARTBEAT_POWER_OUTAGE_COUNT] - 1
-            self.debug("Power outage count: %s", power_outage_count)
-
-        # Update firmware version on Basic cluster (standard ZCL attribute)
-        if HEARTBEAT_FIRMWARE_VERSION in heartbeat_data:
-            fw_version = heartbeat_data[HEARTBEAT_FIRMWARE_VERSION]
-            version_str = str(fw_version)
-            self.debug("Firmware version: %s", version_str)
-            self.endpoint.basic.update_attribute(
-                Basic.AttributeDefs.sw_build_id.id,
-                version_str,
-            )
-
-        # Simulate running_state based on temperature difference
-        # The device doesn't report running_state, but we can derive it
-        if (
-            HEARTBEAT_LOCAL_TEMPERATURE in heartbeat_data
-            and HEARTBEAT_HEATING_SETPOINT in heartbeat_data
-        ):
-            local_temp = heartbeat_data[HEARTBEAT_LOCAL_TEMPERATURE]
-            setpoint = heartbeat_data[HEARTBEAT_HEATING_SETPOINT]
-            # Get current system_mode from cluster cache
-            system_mode = self._attr_cache.get(SYSTEM_MODE, SystemMode.Heat)
-
-            if system_mode == SystemMode.Off:
-                # System is off, not heating
-                running_state = 0  # Idle
-            elif setpoint > local_temp:
-                # Need to heat - setpoint higher than current temperature
-                running_state = Thermostat.RunningState.Heat_State_On
-            else:
-                # At or above setpoint, not heating
-                running_state = 0  # Idle
-
-            self.endpoint.thermostat.update_attribute(
-                Thermostat.AttributeDefs.running_state.id,
-                running_state,
-            )
-
-    async def read_attributes(
-        self,
-        attributes: list[int | str],
-        allow_cache: bool = False,
-        only_cache: bool = False,
-        manufacturer: int | t.uint16_t | None = None,
-    ):
-        """Read attributes with Xiaomi manufacturer code."""
-        if manufacturer is None:
-            manufacturer = XIAOMI_MANUFACTURER_CODE
-        return await super().read_attributes(
-            attributes, allow_cache, only_cache, manufacturer
-        )
-
-    async def write_attributes(
-        self, attributes: dict[str | int, Any], manufacturer: int | None = None
-    ) -> list:
-        """Write attributes with Xiaomi manufacturer code."""
-        if manufacturer is None:
-            manufacturer = XIAOMI_MANUFACTURER_CODE
-
-        attrs_to_write = {}
-        for attr, value in attributes.items():
-            # Resolve attribute name to ID if needed
-            if isinstance(attr, str):
-                attr_def = self.attributes_by_name.get(attr)
-                if attr_def:
-                    attr = attr_def.id
-                else:
-                    self.debug("Unknown attribute name: %s", attr)
-                    continue
-
-            # Handle calibrate trigger specially - writing 1 triggers calibration
-            if attr == CALIBRATE:
-                attrs_to_write[attr] = t.uint8_t(1)
-            # Handle away_preset_temperature - value already in centidegrees from Number entity
-            elif attr == AWAY_PRESET_TEMPERATURE:
-                attrs_to_write[attr] = t.uint32_t(int(value))
-            else:
-                attrs_to_write[attr] = value
-
-        return await super().write_attributes(attrs_to_write, manufacturer)
 
 
 (
@@ -694,10 +430,8 @@ class AqaraThermostatSpecificCluster(XiaomiAqaraE1Cluster):
     .replaces(ThermostatCluster)
     .replaces(AqaraThermostatSpecificCluster)
     .replaces(XiaomiPowerConfiguration)
-    .adds(LocalDeviceTemperatureCluster)
-    # Complete entity definitions for this device.
-    # unique_id_suffix values match legacy ZHA entity IDs for seamless migration
-    # (prevents duplicate entities and preserves automations/dashboards).
+    # Entity definitions with unique_id_suffix matching legacy ZHA entity IDs
+    # for seamless migration (prevents duplicates, preserves automations).
     #
     # Switches
     .switch(
@@ -711,7 +445,7 @@ class AqaraThermostatSpecificCluster(XiaomiAqaraE1Cluster):
         AqaraThermostatSpecificCluster.AttributeDefs.window_detection.name,
         AqaraThermostatSpecificCluster.cluster_id,
         translation_key="window_detection",
-        fallback_name="Open window detection",
+        fallback_name="Window detection",
         unique_id_suffix="64704-window_detection",
     )
     .switch(
@@ -783,15 +517,6 @@ class AqaraThermostatSpecificCluster(XiaomiAqaraE1Cluster):
         translation_key="away_preset_temperature",
         fallback_name="Away preset temperature",
         unique_id_suffix="64704-away_preset_temperature",
-    )
-    # Button
-    .write_attr_button(
-        AqaraThermostatSpecificCluster.AttributeDefs.calibrate.name,
-        1,
-        AqaraThermostatSpecificCluster.cluster_id,
-        entity_type=EntityType.CONFIG,
-        translation_key="calibrate",
-        fallback_name="Calibrate",
     )
     .add_to_registry()
 )
